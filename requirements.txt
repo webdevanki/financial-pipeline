@@ -1,0 +1,15 @@
+# Install with the official Airflow constraints for reproducible builds:
+#   pip install -r requirements.txt \
+#     --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.9.1/constraints-3.12.txt"
+
+apache-airflow==2.9.1
+apache-airflow-providers-postgres>=5.7.0
+
+# Processing
+pyspark==3.5.1
+duckdb>=0.10.0
+psycopg2-binary>=2.9.0
+
+# Dev / testing
+pytest>=8.0.0
+ruff>=0.4.0

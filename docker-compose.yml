@@ -8,6 +8,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
     PYTHONPATH: /opt/airflow
+    _PIP_ADDITIONAL_REQUIREMENTS: "duckdb>=0.10.0 apache-airflow-providers-postgres>=5.7.0"
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs

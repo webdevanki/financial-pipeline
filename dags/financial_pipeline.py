@@ -255,7 +255,7 @@ def financial_pipeline() -> None:
         with hook.get_conn() as conn, conn.cursor() as cur:
             for tx_id, user_id, amount, category, cat_avg, z_score in anomaly_rows:
                 reason = (
-                    f"z-score={z_score} | {float(amount):.2f} PLN "
+                    f"[{category}] z-score={z_score} | {float(amount):.2f} PLN "
                     f"vs category avg {float(cat_avg):.2f} PLN"
                 )
                 cur.execute("""

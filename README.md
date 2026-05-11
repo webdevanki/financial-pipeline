@@ -1,135 +1,207 @@
-# 💳 Financial Data Pipeline
+# Financial Data Pipeline
 
-> Dzienny pipeline danych finansowych zbudowany z Apache Airflow, PySpark i PostgreSQL.  
-> Projekt demonstracyjny w stylu Allegro Pay – orkiestracja, transformacje i wykrywanie anomalii.
+[![CI](https://github.com/webdevanki/financial-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/webdevanki/financial-pipeline/actions/workflows/ci.yml)
+
+A production-style daily financial pipeline built with **Apache Airflow**, **PySpark**, **DuckDB**, and **PostgreSQL**, following the **medallion architecture** (Bronze → Silver → Gold).
+
+Inspired by real-world fintech data engineering patterns (Allegro Pay scale).
 
 ---
 
-## Architektura
+## Architecture
 
 ```
-┌─────────────┐    ┌──────────────┐    ┌─────────────────┐    ┌──────────────┐
-│  Data Source │───▶│   Airflow    │───▶│    PySpark      │───▶│  PostgreSQL  │
-│  (generator) │    │  Scheduler   │    │  Aggregation +  │    │  daily_      │
-│              │    │  + DAG       │    │  Anomaly Det.   │    │  summary     │
-└─────────────┘    └──────────────┘    └─────────────────┘    └──────────────┘
+┌──────────────┐   Bronze    ┌──────────────┐   Silver    ┌──────────────┐
+│  Data Ingest │────────────▶│  Validation  │────────────▶│  PostgreSQL  │
+│  (generator) │             │  + DQ Metrics│             │  raw_trans.  │
+└──────────────┘             └──────────────┘             └──────┬───────┘
+                                                                  │  Gold
+                                                     ┌────────────┴────────────┐
+                                              ┌──────▼──────┐          ┌───────▼──────┐
+                                              │  PySpark /  │          │   Anomaly    │
+                                              │  aggregate  │          │  Detection   │
+                                              │    Gold     │          │  (z-score)   │
+                                              └──────┬──────┘          └──────────────┘
+                                                     │
+                                              ┌──────▼──────┐
+                                              │   DuckDB    │  ← in-memory OLAP
+                                              │  Analytics  │    (revenue share,
+                                              │             │     avg ticket)
+                                              └──────┬──────┘
+                                                     │
+                                              ┌──────▼──────┐
+                                              │   Notify    │  ← daily KPI report
+                                              │  (+ alert)  │    + on-call escalation
+                                              └─────────────┘
 ```
 
-## Stack technologiczny
+## Tech Stack
 
-| Technologia | Wersja | Zastosowanie |
+| Technology | Version | Role |
 |---|---|---|
-| Apache Airflow | 2.9.1 | Orkiestracja pipeline'u (DAGi, scheduling) |
-| Apache Spark | 3.5 | Przetwarzanie dużych zbiorów danych |
-| PySpark | 3.5.1 | Python API do Sparka |
-| PostgreSQL | 15 | Data warehouse (raw + aggregated) |
-| Docker Compose | 3.8 | Konteneryzacja środowiska |
+| Apache Airflow | 2.9.1 | Pipeline orchestration, scheduling, retries |
+| Apache Spark / PySpark | 3.5 | Large-scale aggregations, window functions |
+| DuckDB | ≥ 0.10 | In-memory OLAP — revenue share, trend analysis |
+| PostgreSQL | 15 | DWH storage (Bronze / Silver / Gold tables) |
+| Docker Compose | — | Local containerised environment |
+| GitHub Actions | — | CI: lint + DAG import test + unit tests |
 
-## Pipeline – kroki
+## Pipeline DAG
 
 ```
-generate_data
-     │
-validate_data          ← walidacja kompletności i typów
-     │
-load_raw_to_postgres   ← INSERT z idempotencją (ON CONFLICT DO NOTHING)
-     │
-     ├── aggregate_in_python  ← agregacja per kategoria (→ daily_summary)
-     │         │
-     │    save_summary
-     │
-     └── detect_anomalies     ← reguła 2-sigma (z-score > 2.5)
-               │
-            notify             ← raport dzienny (Slack-ready)
+ingest_bronze
+      │
+validate_silver          ← business-rule checks, reject-rate SLA (< 10 %)
+      │
+data_quality_metrics     ← DQ KPIs (reject rate, nulls, avg/max amount)
+      │
+load_to_postgres         ← idempotent INSERT … ON CONFLICT DO NOTHING
+      │
+      ├─── aggregate_gold     ← category-level summary (PySpark in production)
+      │          │
+      │    duckdb_analytics   ← in-memory OLAP: revenue share, avg ticket
+      │          │
+      │    save_summary       ← upsert into daily_summary (Gold)
+      │
+      └─── detect_anomalies   ← SQL window: z-score > 2.5σ per category
+                 │
+            notify             ← daily report + PagerDuty escalation
 ```
 
-## Uruchomienie lokalne
+**Schedule:** `0 6 * * *` UTC | **SLA:** 2 h | **Retries:** 2 × 5 min
 
-### Wymagania
+## Quick Start
+
+### Requirements
+
 - Docker + Docker Compose
-- min. 4 GB RAM dla Dockera
+- 4 GB RAM available for Docker
 
-### Start
+### Run
 
 ```bash
-git clone https://github.com/TWOJ_USERNAME/financial-pipeline
+git clone https://github.com/webdevanki/financial-pipeline
 cd financial-pipeline
 
-# Uruchom cały stack
+# Start the full stack (Airflow + Postgres + Spark)
 docker compose up -d
 
-# Poczekaj ~2 minuty na inicjalizację Airflow
-# Sprawdź status
+# Wait ~2 minutes for Airflow to initialise, then check status
 docker compose ps
 ```
 
-### Dostęp do UI
+### Services
 
-| Serwis | URL | Login |
+| Service | URL | Credentials |
 |---|---|---|
 | Airflow UI | http://localhost:8080 | admin / admin |
-| Spark UI | http://localhost:8081 | – |
+| Spark UI | http://localhost:8081 | — |
 | PostgreSQL | localhost:5432 | airflow / airflow |
 
-### Uruchomienie DAGa
+### Trigger the DAG
 
 ```bash
-# Przez Airflow UI: zaloguj się → DAGs → financial_pipeline → Trigger DAG
+# Via Airflow UI: DAGs → financial_pipeline → Trigger DAG
 
-# Lub przez CLI:
-docker compose exec airflow-scheduler airflow dags trigger financial_pipeline
+# Or via CLI:
+docker compose exec airflow-scheduler \
+    airflow dags trigger financial_pipeline
 ```
 
-### PySpark job lokalnie
+### Run the PySpark job standalone
 
 ```bash
-# Wejdź do kontenera Spark i uruchom job z przykładowymi danymi
-docker compose exec spark-master spark-submit \
-    /opt/spark_jobs/aggregate_transactions.py --mode sample
+# Inside the Spark container (sample data, no Postgres needed)
+docker compose exec spark-master \
+    spark-submit /opt/spark_jobs/aggregate_transactions.py --mode sample
 
-# Lub z Pythonem lokalnie (po: pip install pyspark)
-python spark_jobs/aggregate_transactions.py --mode sample --date 2024-01-15
+# Or locally after: pip install pyspark
+python aggregate_transactions.py --mode sample --date 2024-01-15
 ```
 
-## Struktura projektu
+## Schema (Medallion DDL)
+
+See [sql/schema.sql](sql/schema.sql) for the full DDL.
+
+| Layer | Table | Description |
+|---|---|---|
+| Bronze | `raw_transactions` | Raw ingest, append-only, indexed by date/category |
+| Silver | `anomalies` | Quarantined rows flagged by z-score detection |
+| Gold | `daily_summary` | Aggregated KPIs per category, BI-ready |
+| Audit | `dq_run_log` | Data-quality metrics per pipeline run |
+
+## Tests & CI
+
+```bash
+# Install dev dependencies
+pip install -r requirements.txt
+
+# Run tests
+pytest tests/ -v
+```
+
+GitHub Actions runs on every push and PR:
+1. **Lint** — `ruff check` on all Python files
+2. **DAG smoke-test** — verifies the DAG imports without errors
+3. **Unit tests** — schedule, SLA, retry config, task presence
+
+## Project Structure
 
 ```
 financial-pipeline/
 ├── dags/
-│   └── financial_pipeline.py   # Główny DAG z TaskFlow API
-├── spark_jobs/
-│   └── aggregate_transactions.py  # PySpark: agregacje + anomalie
-├── config/
-│   └── init_db.sql             # Schemat bazy danych
-├── data/
-│   ├── raw/                    # Surowe dane (CSV, JSON)
-│   └── processed/              # Wyniki Sparka (Parquet)
-├── docker-compose.yml
+│   └── financial_pipeline.py      # Airflow DAG (TaskFlow API, medallion layers)
+├── aggregate_transactions.py       # PySpark job: aggregations + z-score anomaly detection
+├── sql/
+│   └── schema.sql                 # Bronze / Silver / Gold DDL
+├── tests/
+│   ├── conftest.py
+│   └── test_pipeline.py
+├── .github/
+│   └── workflows/
+│       └── ci.yml                 # Lint + smoke-test + unit tests
+├── docker-compose.yml             # Airflow + Postgres + Spark
 ├── requirements.txt
 └── README.md
 ```
 
-## Kluczowe koncepty
+## Key Engineering Concepts
 
-**Idempotentność** – każdy task może być uruchomiony wielokrotnie bez duplikowania danych (`ON CONFLICT DO NOTHING`, `write.mode("overwrite")`).
+**Medallion architecture** — Bronze (raw) → Silver (cleansed) → Gold (aggregated) separates concerns and enables independent reprocessing of any layer.
 
-**XCom** – mechanizm Airflow do przekazywania małych danych między taskami. Duże dane zawsze przez bazę lub storage.
+**Idempotency** — every load step uses `ON CONFLICT DO NOTHING` or `DO UPDATE SET`, making re-runs safe without data duplication.
 
-**Lazy evaluation** – PySpark buduje plan wykonania (DAG operacji) i uruchamia go dopiero przy `show()`/`write()`. Pozwala na optymalizację całego planu.
+**Statistical anomaly detection** — z-score computed via SQL window functions (`AVG` / `STDDEV` + `PARTITION BY category`) — one database pass instead of a Python loop.
 
-**Window functions** – agregacje bez utraty wierszy. Używane do wykrywania anomalii metodą z-score.
+**DuckDB for in-process OLAP** — Gold data is pulled into DuckDB (`:memory:`) to run columnar window queries (revenue share, avg-ticket ranking) without extra infrastructure. Mirrors how analysts iterate fast on a data mesh.
 
-## Wyniki
+**Data quality gate** — `validate_silver` enforces a 10 % reject-rate SLA; `data_quality_metrics` emits per-run KPIs that can feed Grafana or a DQ platform.
 
-Po uruchomieniu pipeline'u w bazie dostępne są:
+**Observability** — `on_failure_callback` and `sla` on every task; `notify` escalates to on-call when anomaly count exceeds the `anomaly_alert_threshold` Airflow Variable.
+
+**XCom discipline** — only small summary dicts travel through XCom; bulk data lives in Postgres.
+
+## Sample Queries
 
 ```sql
--- Dzienna agregacja per kategoria
-SELECT * FROM daily_summary ORDER BY summary_date DESC, total_amount DESC;
+-- Daily revenue share per category
+SELECT
+    summary_date,
+    category,
+    total_amount,
+    ROUND(total_amount / SUM(total_amount) OVER (PARTITION BY summary_date), 4) AS share
+FROM daily_summary
+ORDER BY summary_date DESC, total_amount DESC;
 
--- Wykryte anomalie
-SELECT * FROM anomalies ORDER BY detected_at DESC LIMIT 20;
+-- Top anomalies in the last 7 days
+SELECT tx_id, user_id, amount, reason, detected_at
+FROM anomalies
+WHERE detected_at >= NOW() - INTERVAL '7 days'
+ORDER BY amount DESC
+LIMIT 20;
 
--- Raw transactions
-SELECT category, COUNT(*), AVG(amount) FROM raw_transactions GROUP BY 1;
+-- Data-quality trend
+SELECT run_date, total_count, reject_count, reject_rate
+FROM dq_run_log
+ORDER BY run_date DESC;
 ```

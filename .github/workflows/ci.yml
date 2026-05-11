@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check dags/ aggregate_transactions.py
+
+  test:
+    name: DAG smoke-test & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          pip install \
+            "apache-airflow==2.9.1" \
+            "apache-airflow-providers-postgres>=5.7.0" \
+            "duckdb>=0.10.0" \
+            pytest
+
+      - name: Initialise Airflow DB (SQLite)
+        env:
+          AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////tmp/airflow_test.db
+          AIRFLOW__CORE__UNIT_TEST_MODE: "true"
+        run: airflow db init
+
+      - name: DAG import smoke-test
+        env:
+          AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////tmp/airflow_test.db
+          AIRFLOW__CORE__UNIT_TEST_MODE: "true"
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -c "from dags.financial_pipeline import dag_instance; print('DAG OK')"
+
+      - name: Run unit tests
+        env:
+          AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////tmp/airflow_test.db
+          AIRFLOW__CORE__UNIT_TEST_MODE: "true"
+          PYTHONPATH: ${{ github.workspace }}
+        run: pytest tests/ -v
