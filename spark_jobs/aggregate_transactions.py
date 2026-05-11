@@ -13,27 +13,24 @@ Przez Airflow → SparkSubmitOperator lub BashOperator z spark-submit.
 """
 
 import argparse
-import os
-from datetime import date
+import random
+import uuid
+from datetime import date, datetime
 
-# PySpark imports
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
-    DateType, DecimalType, IntegerType, StringType, StructField, StructType,
+    DateType, FloatType, IntegerType, StringType, StructField, StructType,
 )
 from pyspark.sql.window import Window
 
 
 # ── Schema danych wejściowych ──────────────────────────────────────────────────
-#
-# Definiowanie schematu explicite = lepsza wydajność (brak skanowania danych)
-# + jawna dokumentacja struktury danych.
 
 TRANSACTION_SCHEMA = StructType([
     StructField("tx_id",    StringType(),  nullable=False),
     StructField("user_id",  IntegerType(), nullable=False),
-    StructField("amount",   DecimalType(12, 2), nullable=False),
+    StructField("amount",   FloatType(),   nullable=False),  
     StructField("currency", StringType(),  nullable=True),
     StructField("merchant", StringType(),  nullable=True),
     StructField("category", StringType(),  nullable=True),
@@ -45,13 +42,13 @@ def create_spark_session(app_name: str = "FinancialPipeline") -> SparkSession:
     """
     SparkSession = punkt wejścia do PySpark.
     Jeden SparkSession per aplikacja.
-    .getOrCreate() = bezpieczne – zwraca istniejącą sesję jeśli jest.
+    .getOrCreate() = bezpieczne zwraca istniejącą sesję jeśli jest.
     """
     return (
         SparkSession.builder
         .appName(app_name)
-        .config("spark.sql.adaptive.enabled", "true")       # AQE – optymalizuje plany zapytań
-        .config("spark.sql.shuffle.partitions", "8")         # dla małych danych: mniej partycji
+        .config("spark.sql.adaptive.enabled", "true")
+        .config("spark.sql.shuffle.partitions", "8")
         .getOrCreate()
     )
 
@@ -59,7 +56,6 @@ def create_spark_session(app_name: str = "FinancialPipeline") -> SparkSession:
 def read_from_postgres(spark: SparkSession, run_date: str):
     """
     Odczyt danych z Postgresa przez JDBC.
-    W produkcji często odczytujesz z S3/GCS/ADLS lub Snowflake.
     """
     jdbc_url = "jdbc:postgresql://postgres:5432/airflow"
     properties = {
@@ -80,13 +76,12 @@ def read_from_postgres(spark: SparkSession, run_date: str):
 
 def read_sample_data(spark: SparkSession, run_date: str):
     """
-    Wersja do nauki – generuje dane in-memory bez potrzeby Postgresa.
-    Idealny punkt startowy do eksperymentowania z PySpark API.
+    Wersja do nauki — generuje dane in-memory bez potrzeby Postgresa.
     """
-    import random
-    import uuid
-
     categories = ["food", "transport", "entertainment", "shopping", "utilities"]
+
+    run_date_obj = datetime.strptime(run_date, "%Y-%m-%d").date()
+
     data = []
     for _ in range(1000):
         cat = random.choice(categories)
@@ -98,10 +93,9 @@ def read_sample_data(spark: SparkSession, run_date: str):
             "PLN",
             "Merchant_" + cat,
             cat,
-            run_date,
+            run_date_obj,
         ))
 
-    # createDataFrame = tworzy DataFrame z listy krotek + schemat
     df = spark.createDataFrame(data, schema=TRANSACTION_SCHEMA)
     print(f"Wygenerowano {df.count()} przykładowych rekordów")
     return df
@@ -110,13 +104,7 @@ def read_sample_data(spark: SparkSession, run_date: str):
 # ── Transformacje ──────────────────────────────────────────────────────────────
 
 def aggregate_by_category(df):
-    """
-    groupBy + agg = podstawa PySpark.
-    Zwraca statystyki per kategoria.
 
-    Uwaga: PySpark jest LAZY – żadne obliczenia nie dzieją się tutaj.
-    Spark buduje plan (DAG operacji) i wykonuje go dopiero przy .show()/.write().
-    """
     return (
         df.groupBy("category")
         .agg(
@@ -132,25 +120,20 @@ def aggregate_by_category(df):
 
 def detect_anomalies(df):
     """
-    Window functions = potężne narzędzie do obliczeń w obrębie grupy.
-    Analogia SQL: AVG(amount) OVER (PARTITION BY category)
-
-    Tutaj: obliczamy średnią i odchylenie standardowe per kategoria,
-    a potem flagujemy transakcje > avg + 2*stddev (reguła 2-sigma).
+    Window functions — obliczenia w obrębie grupy bez redukowania wierszy.
+    Z-score > 2.5 = anomalia statystyczna.
     """
-    # Window = "okno" obliczeniowe – partycja po kategorii
     window = Window.partitionBy("category")
 
-    df_stats = df.withColumn(
-        "cat_avg", F.avg("amount").over(window)
-    ).withColumn(
-        "cat_stddev", F.stddev("amount").over(window)
-    ).withColumn(
-        "z_score",
-        (F.col("amount") - F.col("cat_avg")) / F.col("cat_stddev")
+    df_stats = (
+        df
+        .withColumn("cat_avg",    F.avg("amount").over(window))
+        .withColumn("cat_stddev", F.stddev("amount").over(window))
+        .withColumn("z_score",
+            (F.col("amount") - F.col("cat_avg")) / F.col("cat_stddev")
+        )
     )
 
-    # Anomalia = z-score > 2.5 (transakcja > avg + 2.5 * stddev)
     anomalies = (
         df_stats
         .filter(F.col("z_score") > 2.5)
@@ -166,8 +149,8 @@ def detect_anomalies(df):
 
 def user_spending_rank(df):
     """
-    Przykład rankingu użytkowników – typowe zadanie w fintech.
-    rank() vs dense_rank(): dense_rank nie pomija numerów po remisach.
+    Ranking użytkowników po wydatkach.
+    dense_rank nie pomija numerów po remisach.
     """
     window = Window.orderBy(F.desc("total_spent"))
 
@@ -175,7 +158,7 @@ def user_spending_rank(df):
         df.groupBy("user_id")
         .agg(F.sum("amount").alias("total_spent"))
         .withColumn("rank", F.dense_rank().over(window))
-        .filter(F.col("rank") <= 10)  # Top 10 użytkowników
+        .filter(F.col("rank") <= 10)
     )
 
 
@@ -192,7 +175,7 @@ def main():
     print(f"{'='*50}\n")
 
     spark = create_spark_session()
-    spark.sparkContext.setLogLevel("WARN")  # Wyciszamy verbose logi Sparka
+    spark.sparkContext.setLogLevel("WARN")
 
     # 1. Wczytaj dane
     if args.mode == "postgres":
@@ -200,7 +183,7 @@ def main():
     else:
         df = read_sample_data(spark, args.date)
 
-    # 2. Podgląd danych (zawsze rób to na początku!)
+    # 2. Podgląd danych
     print("\n── Schemat danych ──")
     df.printSchema()
 
@@ -223,7 +206,7 @@ def main():
     top_users = user_spending_rank(df)
     top_users.show(truncate=False)
 
-    # 6. Zapis wyników (w produkcji → Snowflake / S3 / Postgres)
+    # 6. Zapis wyników do Parquet
     output_path = f"/opt/data/processed/summary_{args.date}"
     summary.write.mode("overwrite").parquet(output_path)
     print(f"\n✓ Wyniki zapisane do: {output_path}")
