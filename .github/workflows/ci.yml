@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install ruff
-      - run: ruff check dags/ aggregate_transactions.py
+      - run: ruff check dags/ spark_jobs/
 
   test:
     name: DAG smoke-test & unit tests
